@@ -1,300 +1,511 @@
-import json
-import re
-import pandas as pd
-from typing import TypedDict, Dict, List
+from typing import TypedDict, List, Dict, Tuple, Optional
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
+import re
+import traceback
 
-# ============================================================
-# LM STUDIO CONFIG
-# ============================================================
+# ==========================================
+# LOGGING SETUP
+# ==========================================
+
+LOG_FILE = "simulation_log.txt"
+
+def log_write(text: str):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(text + "\n")
+
+open(LOG_FILE, "w").close()
+
+# ==========================================
+# LLM SETUP
+# ==========================================
 
 client = OpenAI(
     base_url="http://localhost:1234/v1",
     api_key="sk-lm-CnAy7yZu:OFT986jcpFQgYmA5hOxg"
 )
 
-def llm_call(prompt):
-    response = client.chat.completions.create(
-        model="google/gemma-3-4b",
-        messages=[
-            {"role": "system", "content": "You are a rational planning agent."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
+def llm_call(prompt: str, tag: str):
+    log_write(f"\n==============================")
+    log_write(f"{tag} — LLM INPUT")
+    log_write(f"==============================")
+    log_write(prompt)
 
+    try:
+        response = client.chat.completions.create(
+            model="google/gemma-3-4b",
+            messages=[
+                {"role": "system", "content": "You are a rational strategic agent."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        )
 
-# ============================================================
-# LOGGING
-# ============================================================
+        raw_output = response.choices[0].message.content
 
-LOG_FILE = "agent_trace_log.txt"
-open(LOG_FILE, "w").close()  # reset each run
+        log_write(f"\n{tag} — RAW OUTPUT OBJECT")
+        log_write(str(response))
 
-def log_trace(step, agent, prompt, raw):
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write("\n" + "="*80 + "\n")
-        f.write(f"STEP: {step} | AGENT: {agent}\n")
-        f.write("-"*80 + "\nPROMPT:\n")
-        f.write(prompt + "\n")
-        f.write("-"*80 + "\nRAW OUTPUT:\n")
-        f.write(raw + "\n")
+        log_write(f"\n{tag} — RAW TEXT OUTPUT")
+        log_write(f"[Length: {len(raw_output) if raw_output else 0}]")
+        log_write(raw_output if raw_output else "[EMPTY STRING RETURNED]")
 
+        return raw_output.strip() if raw_output else ""
 
-# ============================================================
-# GRID CONSTANTS
-# ============================================================
+    except Exception as e:
+        log_write(f"\n{tag} — EXCEPTION")
+        log_write(str(e))
+        log_write(traceback.format_exc())
+        return ""
 
-GRID_SIZE = 5
+# ==========================================
+# GRID CONFIG
+# ==========================================
 
-WALLS = {(2,0), (2,2), (2,4)}
-BRIDGES = {(2,1), (2,3)}
+GRID_W, GRID_H = 5, 5
+WALLS = {(2, 4), (2, 2), (2, 0)}
+BRIDGES = {"upper bridge": (2, 3), "lower bridge": (2, 1)}
 
-START_POS = {
-    "A1": (0,2),
-    "A2": (4,2)
+A1_START = (0, 2)
+A2_START = (4, 2)
+
+A1_GOAL_X = 4
+A2_GOAL_X = 0
+
+MOVE_DELTAS = {
+    "UP": (0, 1),
+    "DOWN": (0, -1),
+    "LEFT": (-1, 0),
+    "RIGHT": (1, 0),
+    "STAY": (0, 0),
 }
 
-GOALS = {
-    "A1": 4,
-    "A2": 0
-}
+# ==========================================
+# STATE TYPE
+# ==========================================
 
-
-# ============================================================
-# STATE
-# ============================================================
-
-class GridState(TypedDict, total=False):
+class SimulationState(TypedDict):
+    grid_state: Dict[str, Tuple[int, int]]
+    transcript: str
+    shared_history: List[str]
+    outcome_summary: str
     step: int
-    agent_positions: Dict[str, tuple]
-    history: List[Dict]
-    done: bool
+    move1: Optional[str]
+    move2: Optional[str]
+    recent_rounds: List[Dict[str, str]]   # NEW: keep last N rounds
 
-    conversation_round: int
-    messages: List[Dict]
-    final_decisions: Dict[str, str]
+# ==========================================
+# DESCRIPTIVE GRID EXPLANATION
+# ==========================================
 
+def describe_grid(state):
+    return f"""
+The world is a square grid that is 5 columns wide and 5 rows tall.
 
-# ============================================================
-# MOVE LOGIC
-# ============================================================
+Coordinates:
+- x increases as you move RIGHT.
+- y increases as you move UP.
 
-def compute_move(position, move):
-    x, y = position
-    if move == "UP":
-        return (x, y-1)
-    if move == "DOWN":
-        return (x, y+1)
-    if move == "LEFT":
-        return (x-1, y)
-    if move == "RIGHT":
-        return (x+1, y)
-    return position
+The middle column (x = 2) represents a river that runs vertically
+from the bottom of the grid to the top.
 
-def valid_position(pos):
+Most cells in this river are water and cannot be stepped on.
+The water cells are located at: {sorted(list(WALLS))}
+
+There are exactly two bridges that allow crossing the river:
+
+1. The upper bridge located at {BRIDGES["upper bridge"]}
+2. The lower bridge located at {BRIDGES["lower bridge"]}
+
+Only ONE agent may stand on a bridge at any time.
+
+Movement Rules:
+- Each turn both agents move simultaneously.
+- You may move one step: UP, DOWN, LEFT, RIGHT, or STAY.
+- You cannot move outside the grid boundaries.
+- You cannot enter water cells.
+- You cannot occupy the same cell as the other agent.
+- You cannot swap positions in one move.
+- If a move is invalid, you remain in place.
+
+Current Positions:
+- A1 is at {state['grid_state']['A1']}
+- A2 is at {state['grid_state']['A2']}
+
+Goals:
+- A1 must reach any cell where x = {A1_GOAL_X}
+- A2 must reach any cell where x = {A2_GOAL_X}
+"""
+
+def describe_grid_for_agent(state, agent_name):
+
+    pos = state["grid_state"][agent_name]
+
+    if agent_name == "A1":
+        goal_x = A1_GOAL_X
+        direction_hint = "RIGHT"
+        wrong_hint = "LEFT"
+    else:
+        goal_x = A2_GOAL_X
+        direction_hint = "LEFT"
+        wrong_hint = "RIGHT"
+
+    distance = abs(goal_x - pos[0])
+
+    return f"""
+The world is a square grid that is 5 columns wide and 5 rows tall.
+
+Coordinates:
+- x increases when moving RIGHT
+- x decreases when moving LEFT
+- y increases when moving UP
+
+The middle column (x = 2) represents a river that runs vertically
+from the bottom of the grid to the top.
+
+Most cells in this river are water and cannot be stepped on.
+The water cells are located at: {sorted(list(WALLS))}
+
+There are exactly two bridges that allow crossing the river:
+
+1. The upper bridge located at {BRIDGES["upper bridge"]}
+2. The lower bridge located at {BRIDGES["lower bridge"]}
+
+Only ONE agent may stand on a bridge at any time.
+
+Except for (1) water cells and (2) the other agent’s current cell, every other coordinate inside the 5×5 grid is walkable.
+
+YOUR IDENTITY:
+You are {agent_name}.
+Your current position is {pos}.
+
+YOUR GOAL:
+Your goal is to reach ANY cell where x = {goal_x}.
+
+IMPORTANT DIRECTIONAL FACT:
+- Moving {direction_hint} reduces your distance to the goal.
+- Moving {wrong_hint} increases your distance from the goal.
+
+Your current horizontal distance to goal is: {distance}
+
+Movement Rules:
+- Each turn both agents move simultaneously.
+- You may move one step: UP, DOWN, LEFT, RIGHT, or STAY.
+- You cannot move outside the grid boundaries.
+- You cannot enter water cells.
+- You cannot occupy the same cell as the other agent.
+- You cannot swap positions in one move.
+- If a move is invalid, you remain in place.
+
+Current Positions:
+- A1 is at {state['grid_state']['A1']}
+- A2 is at {state['grid_state']['A2']}
+
+GOALS (NOT SYMMETRIC):
+- A1 goal: reach x=4 (right edge)
+- A2 goal: reach x=0 (left edge)
+- Your goal is the horizontal opposite of the other agent’s goal.
+"""
+
+# ==========================================
+# HELPERS
+# ==========================================
+
+def apply_move(pos, move):
+    dx, dy = MOVE_DELTAS.get(move, (0, 0))
+    return (pos[0] + dx, pos[1] + dy)
+
+def valid_env(pos):
+    return 0 <= pos[0] < GRID_W and 0 <= pos[1] < GRID_H and pos not in WALLS
+
+def detect_collision(a1_new, a2_new, a1_old, a2_old):
+    if a1_new == a2_new:
+        return "same_cell"
+    if a1_new == a2_old and a2_new == a1_old:
+        return "swap"
+    for bridge in BRIDGES.values():
+        if a1_new == bridge and a2_new == bridge:
+            return "same_bridge"
+    return None
+
+def parse_move(text):
+    match = re.search(r"(UP|DOWN|LEFT|RIGHT|STAY)", text.upper())
+    return match.group(1) if match else "STAY"
+
+COLLISION_DESCRIPTIONS = {
+    "same_cell": "Invalid: both agents tried to end on the same cell.",
+    "swap": "Invalid: agents tried to swap positions in the same turn (A1->A2_old and A2->A1_old).",
+    "same_bridge": "Invalid: both agents tried to use the same bridge in the same turn (only one agent allowed on a bridge).",
+}
+
+ENV_INVALID_DESCRIPTIONS = {
+    "out_of_bounds": "Invalid: you cannot move outside the grid boundaries.",
+    "water": "Invalid: you cannot step onto water (river) cells; only bridge cells allow crossing.",
+}
+
+def env_invalid_reason(pos):
+    """Return (reason_code or None)."""
     x, y = pos
-    if x < 0 or x >= GRID_SIZE or y < 0 or y >= GRID_SIZE:
-        return False
+    if not (0 <= x < GRID_W and 0 <= y < GRID_H):
+        return "out_of_bounds"
     if pos in WALLS:
-        return False
-    return True
+        return "water"
+    return None
 
+def describe_env_effect(agent_name, intended_move, old_pos, attempted_pos, final_pos, reason_code):
+    if reason_code is None:
+        return f"{agent_name} moved {intended_move} from {old_pos} to {final_pos}."
+    # It attempted something invalid and therefore stayed
+    return (
+        f"{agent_name} tried {intended_move} from {old_pos} to {attempted_pos}, "
+        f"but stayed at {final_pos}. Reason: {ENV_INVALID_DESCRIPTIONS.get(reason_code, reason_code)}"
+    )
 
-# ============================================================
-# NEGOTIATION NODE
-# ============================================================
+def format_recent_rounds(state, n=3):
+    rounds = state.get("recent_rounds", [])
+    if not rounds:
+        return "(none yet)"
+    last = rounds[-n:]
+    out = []
+    for r in last:
+        out.append(
+            f"- Step {r['step']}:\n"
+            f"  Negotiation:\n{r['transcript'].rstrip()}\n"
+            f"  Final decisions: A1={r['move1']} | A2={r['move2']}\n"
+            f"  Outcome: {r['outcome'].replace(chr(10),' ')}"
+        )
+    return "\n".join(out)
 
-def negotiation_node(agent_name):
+# ==========================================
+# NODE 1 — NEGOTIATION
+# ==========================================
 
-    def node(state: GridState):
+def negotiation_node(state: SimulationState):
 
-        position = state["agent_positions"][agent_name]
-        other = "A1" if agent_name == "A2" else "A2"
+    log_write(f"\n\n========== STEP {state['step']} — NEGOTIATION ==========")
 
+    transcript = ""
+    # grid_desc = describe_grid(state)
+    
+    recent = format_recent_rounds(state, n=3)
+
+    for i in range(6):
+        speaker = "A1" if i % 2 == 0 else "A2"
+        grid_desc = describe_grid_for_agent(state, speaker)
+        prompt = f"""
+You are {speaker}.
+
+Your goal is to cross the river and reach your target side.
+
+{grid_desc}
+
+Last 3 rounds (negotiations + final decisions + outcomes):
+{recent}
+
+Previous outcome:
+{state['outcome_summary'] if state['outcome_summary'] else "(none yet)"}
+
+Negotiation so far this step:
+{transcript if transcript else "(none yet)"}
+
+You must propose your intended move AND send a short message.
+
+Respond EXACTLY in this format:
+
+PROPOSED_MOVE: <UP|DOWN|LEFT|RIGHT|STAY>
+MESSAGE: <optional arbitraty message to other agent>
+"""
+
+        response = llm_call(prompt, f"STEP {state['step']} — {speaker} NEGOTIATION")
+
+        proposed_move = parse_move(response)
+        message = response.split("MESSAGE:")[-1].strip() if "MESSAGE:" in response else ""
+
+        transcript += f"{speaker}: PROPOSED_MOVE={proposed_move} | MESSAGE={message}\n"
+
+    log_write("\n--- NEGOTIATION TRANSCRIPT ---")
+    log_write(transcript)
+
+    state["transcript"] = transcript
+    return state
+
+# ==========================================
+# NODE 2 — FINAL DECISION
+# ==========================================
+
+def decision_node(state: SimulationState):
+
+    log_write(f"\n========== STEP {state['step']} — FINAL DECISION ==========")
+
+    # grid_desc = describe_grid(state)
+    recent = format_recent_rounds(state, n=3)
+    def decide(agent_name):
+        grid_desc = describe_grid_for_agent(state, agent_name)
         prompt = f"""
 You are {agent_name}.
 
-Grid 5x5. Top-left = (0,0).
-Walls: {WALLS}
-Bridges: {BRIDGES}
-Only one agent may occupy a bridge at a time.
+After reviewing the negotiation transcript below,
+you must now commit to your FINAL MOVE.
 
-Your position: {position}
-Other position: {state['agent_positions'][other]}
+{grid_desc}
 
-Conversation so far:
-{state.get("messages", [])}
+Last 3 rounds (negotiations + final decisions + outcomes):
+{recent}
 
-Discuss and coordinate a plan.
-Do NOT execute yet.
+This step's negotiation transcript:
+{state['transcript']}
 
-Return ONLY raw JSON:
-{{
- "message": "...",
- "proposed_move": "UP/DOWN/LEFT/RIGHT/WAIT"
-}}
+Previous outcome (last step):
+{state['outcome_summary'] if state['outcome_summary'] else "(none yet)"}
+
+Commit to your FINAL MOVE.
+
+Respond ONLY:
+MOVE: <UP|DOWN|LEFT|RIGHT|STAY>
 """
+        response = llm_call(prompt, f"STEP {state['step']} — {agent_name} DECISION")
+        return parse_move(response)
 
-        raw = llm_call(prompt)
-        log_trace(state["step"], agent_name, prompt, raw)
+    state["move1"] = decide("A1")
+    state["move2"] = decide("A2")
 
-        clean = re.sub(r"```json|```", "", raw).strip()
-
-        try:
-            parsed = json.loads(clean)
-        except:
-            parsed = {"message": "Invalid", "proposed_move": "WAIT"}
-
-        state.setdefault("messages", []).append({
-            "agent": agent_name,
-            "content": parsed["message"],
-            "proposal": parsed["proposed_move"]
-        })
-
-        state["conversation_round"] += 1
-
-        return state
-
-    return node
-
-
-# ============================================================
-# EXECUTION NODE
-# ============================================================
-
-def execution_node(state: GridState):
-
-    proposals = {}
-
-    for msg in reversed(state["messages"]):
-        if msg["agent"] not in proposals:
-            proposals[msg["agent"]] = msg["proposal"]
-        if len(proposals) == 2:
-            break
-
-    state["final_decisions"] = proposals
     return state
 
+# ==========================================
+# NODE 3 — ENVIRONMENT
+# ==========================================
 
-# ============================================================
-# ENVIRONMENT NODE
-# ============================================================
+def environment_node(state: SimulationState):
 
-def environment_node(state: GridState):
+    log_write(f"\n========== STEP {state['step']} — ENVIRONMENT ==========")
 
-    decisions = state["final_decisions"]
+    a1_old = state["grid_state"]["A1"]
+    a2_old = state["grid_state"]["A2"]
 
-    new_positions = {}
-    collisions = {}
+    move1 = state["move1"] or "STAY"
+    move2 = state["move2"] or "STAY"
 
-    for agent, move in decisions.items():
-        old = state["agent_positions"][agent]
-        new = compute_move(old, move)
+    # Attempted positions (what they tried)
+    a1_attempt = apply_move(a1_old, move1)
+    a2_attempt = apply_move(a2_old, move2)
 
-        collision = None
+    # Environment validity checks (water/outside)
+    a1_reason = env_invalid_reason(a1_attempt)
+    a2_reason = env_invalid_reason(a2_attempt)
 
-        if not valid_position(new):
-            new = old
-            collision = "wall_or_boundary"
+    # Proposed positions after env constraints (invalid => stay)
+    a1_proposed = a1_old if a1_reason else a1_attempt
+    a2_proposed = a2_old if a2_reason else a2_attempt
 
-        new_positions[agent] = new
-        collisions[agent] = collision
+    # Agent-agent collision checks on env-valid proposals
+    collision = detect_collision(a1_proposed, a2_proposed, a1_old, a2_old)
 
-    # Same cell collision
-    if len(set(new_positions.values())) < 2:
-        for agent in new_positions:
-            new_positions[agent] = state["agent_positions"][agent]
-            collisions[agent] = "agent_collision"
+    # If agent collision, both stay (and we describe it)
+    if collision:
+        a1_final, a2_final = a1_old, a2_old
+        collision_desc = COLLISION_DESCRIPTIONS.get(collision, collision)
+    else:
+        a1_final, a2_final = a1_proposed, a2_proposed
+        collision_desc = "none"
 
-    # Bridge conflict
-    bridge_occupants = [pos for pos in new_positions.values() if pos in BRIDGES]
-    if len(bridge_occupants) > 1:
-        for agent in new_positions:
-            if new_positions[agent] in BRIDGES:
-                new_positions[agent] = state["agent_positions"][agent]
-                collisions[agent] = "bridge_conflict"
+    state["grid_state"]["A1"] = a1_final
+    state["grid_state"]["A2"] = a2_final
 
-    for agent in ["A1","A2"]:
-        state["history"].append({
-            "step": state["step"],
-            "agent": agent,
-            "move": decisions.get(agent,"WAIT"),
-            "collision": collisions[agent]
-        })
+    # Descriptive per-agent outcome lines (include env reasons if any)
+    a1_line = describe_env_effect("A1", move1, a1_old, a1_attempt, a1_final, a1_reason if not collision else None)
+    a2_line = describe_env_effect("A2", move2, a2_old, a2_attempt, a2_final, a2_reason if not collision else None)
 
-    state["agent_positions"] = new_positions
+    # If agent collision happened, override with collision explanation (they stayed due to collision)
+    if collision:
+        a1_line = f"A1 intended {move1} from {a1_old} toward {a1_proposed}, but both stayed. Reason: {collision_desc}"
+        a2_line = f"A2 intended {move2} from {a2_old} toward {a2_proposed}, but both stayed. Reason: {collision_desc}"
+
+    outcome = f"""
+Step {state['step']} RESULT:
+{a1_line}
+{a2_line}
+Agent-agent collision: {collision_desc}
+""".strip()
+
+    log_write("\n--- EXECUTION RESULT ---")
+    log_write(outcome)
+
+    # Save into shared history
+    state["outcome_summary"] = outcome
+    state["shared_history"].append(outcome)
+
+    # Save this round into recent_rounds (for next prompts)
+    round_record = {
+        "step": str(state["step"]),
+        "transcript": state.get("transcript", ""),
+        "move1": move1,
+        "move2": move2,
+        "outcome": outcome,
+    }
+    state["recent_rounds"].append(round_record)
+    # Keep it bounded (optional)
+    if len(state["recent_rounds"]) > 20:
+        state["recent_rounds"] = state["recent_rounds"][-20:]
+
     state["step"] += 1
-
-    # Reset negotiation
-    state["conversation_round"] = 0
-    state["messages"] = []
-    state["final_decisions"] = {}
-
-    # Check goal
-    if new_positions["A1"][0] == GOALS["A1"] or \
-       new_positions["A2"][0] == GOALS["A2"]:
-        state["done"] = True
-
     return state
 
+# ==========================================
+# LOOP CONDITION
+# ==========================================
 
-# ============================================================
-# ROUTERS
-# ============================================================
+def should_continue(state: SimulationState):
+    if (
+        state["grid_state"]["A1"][0] == A1_GOAL_X and
+        state["grid_state"]["A2"][0] == A2_GOAL_X
+    ):
+        log_write("\nSUCCESS: Both agents reached goals.")
+        return "end"
+    if state["step"] >= 50:
+        log_write("\nSTOP: Max steps reached.")
+        return "end"
+    return "negotiation"
 
-def conversation_router(state: GridState):
-    if state["conversation_round"] >= 6:
-        return "EXECUTE"
-    return "A2_msg" if state["conversation_round"] % 2 == 1 else "A1_msg"
-
-def continue_simulation(state: GridState):
-    if state["done"] or state["step"] > 20:
-        return END
-    return "A1_msg"
-
-
-# ============================================================
+# ==========================================
 # BUILD GRAPH
-# ============================================================
+# ==========================================
 
-builder = StateGraph(GridState)
+workflow = StateGraph(SimulationState)
 
-builder.add_node("A1_msg", negotiation_node("A1"))
-builder.add_node("A2_msg", negotiation_node("A2"))
-builder.add_node("EXECUTE", execution_node)
-builder.add_node("ENV", environment_node)
+workflow.add_node("negotiation", negotiation_node)
+workflow.add_node("decision", decision_node)
+workflow.add_node("environment", environment_node)
 
-builder.set_entry_point("A1_msg")
+workflow.set_entry_point("negotiation")
+workflow.add_edge("negotiation", "decision")
+workflow.add_edge("decision", "environment")
 
-builder.add_conditional_edges("A1_msg", conversation_router)
-builder.add_conditional_edges("A2_msg", conversation_router)
+workflow.add_conditional_edges(
+    "environment",
+    should_continue,
+    {"negotiation": "negotiation", "end": END},
+)
 
-builder.add_edge("EXECUTE", "ENV")
+app = workflow.compile()
 
-builder.add_conditional_edges("ENV", continue_simulation)
-
-graph = builder.compile()
-
-
-# ============================================================
+# ==========================================
 # RUN
-# ============================================================
+# ==========================================
 
-initial_state: GridState = {
-    "step": 0,
-    "agent_positions": START_POS.copy(),
-    "history": [],
-    "done": False,
-    "conversation_round": 0,
-    "messages": [],
-    "final_decisions": {}
-}
+if __name__ == "__main__":
 
-final_state = graph.invoke(initial_state)
+    initial_state = SimulationState(
+    grid_state={"A1": A1_START, "A2": A2_START},
+    transcript="",
+    shared_history=[],
+    outcome_summary="",
+    step=0,
+    move1=None,
+    move2=None,
+    recent_rounds=[],  # NEW
+    )
 
-df = pd.DataFrame(final_state["history"])
-print(df)
-print("\nFinal Positions:", final_state["agent_positions"])
+    final_state = app.invoke(initial_state)
+
+    print("\nSimulation finished.")
+    print("Check simulation_log.txt for full trace.")
