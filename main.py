@@ -33,7 +33,7 @@ def llm_call(prompt: str, tag: str):
 
     try:
         response = client.chat.completions.create(
-            model="google/gemma-3-4b",
+            model="openai/gpt-oss-20b",
             messages=[
                 {"role": "system", "content": "You are a rational strategic agent."},
                 {"role": "user", "content": prompt},
@@ -66,8 +66,8 @@ GRID_W, GRID_H = 5, 5
 WALLS = {(2, 4), (2, 2), (2, 0)}
 BRIDGES = {"upper bridge": (2, 3), "lower bridge": (2, 1)}
 
-A1_START = (0, 2)
-A2_START = (4, 2)
+A1_START = (0, 1)
+A2_START = (4, 1)
 
 A1_GOAL_X = 4
 A2_GOAL_X = 0
@@ -93,6 +93,8 @@ class SimulationState(TypedDict):
     move1: Optional[str]
     move2: Optional[str]
     recent_rounds: List[Dict[str, str]]   # NEW: keep last N rounds
+    a1_reached_goal: bool          # NEW
+    a2_reached_goal: bool  
 
 # ==========================================
 # DESCRIPTIVE GRID EXPLANATION
@@ -196,6 +198,7 @@ Movement Rules:
 - You cannot occupy the same cell as the other agent.
 - You cannot swap positions in one move.
 - If a move is invalid, you remain in place.
+- If an agent has reached its goal, it should choose STAY unless it must move to avoid an invalid collision.
 
 Current Positions:
 - A1 is at {state['grid_state']['A1']}
@@ -205,6 +208,10 @@ GOALS (NOT SYMMETRIC):
 - A1 goal: reach x=4 (right edge)
 - A2 goal: reach x=0 (left edge)
 - Your goal is the horizontal opposite of the other agent’s goal.
+
+GOAL STATUS:
+- A1 reached goal: {state['a1_reached_goal']}
+- A2 reached goal: {state['a2_reached_goal']}
 """
 
 # ==========================================
@@ -411,6 +418,13 @@ def environment_node(state: SimulationState):
     state["grid_state"]["A1"] = a1_final
     state["grid_state"]["A2"] = a2_final
 
+    a1_now = state["grid_state"]["A1"]
+    a2_now = state["grid_state"]["A2"]
+
+    # Once reached, stay reached (latches to True)
+    state["a1_reached_goal"] = state["a1_reached_goal"] or (a1_now[0] == A1_GOAL_X)
+    state["a2_reached_goal"] = state["a2_reached_goal"] or (a2_now[0] == A2_GOAL_X)
+
     # Descriptive per-agent outcome lines (include env reasons if any)
     a1_line = describe_env_effect("A1", move1, a1_old, a1_attempt, a1_final, a1_reason if not collision else None)
     a2_line = describe_env_effect("A2", move2, a2_old, a2_attempt, a2_final, a2_reason if not collision else None)
@@ -426,6 +440,20 @@ Step {state['step']} RESULT:
 {a2_line}
 Agent-agent collision: {collision_desc}
 """.strip()
+
+# Append goal status
+    goal_status = []
+    if state["a1_reached_goal"]:
+        goal_status.append("A1 has reached its goal (x=4).")
+    else:
+        goal_status.append("A1 has NOT reached its goal yet (needs x=4).")
+
+    if state["a2_reached_goal"]:
+        goal_status.append("A2 has reached its goal (x=0).")
+    else:
+        goal_status.append("A2 has NOT reached its goal yet (needs x=0).")
+
+    outcome = outcome + "\n\nGOAL STATUS:\n" + "\n".join(goal_status)
 
     log_write("\n--- EXECUTION RESULT ---")
     log_write(outcome)
@@ -455,10 +483,7 @@ Agent-agent collision: {collision_desc}
 # ==========================================
 
 def should_continue(state: SimulationState):
-    if (
-        state["grid_state"]["A1"][0] == A1_GOAL_X and
-        state["grid_state"]["A2"][0] == A2_GOAL_X
-    ):
+    if state["a1_reached_goal"] and state["a2_reached_goal"]:
         log_write("\nSUCCESS: Both agents reached goals.")
         return "end"
     if state["step"] >= 50:
@@ -503,6 +528,8 @@ if __name__ == "__main__":
     move1=None,
     move2=None,
     recent_rounds=[],  # NEW
+    a1_reached_goal=False,   # NEW
+    a2_reached_goal=False,   # NEW
     )
 
     final_state = app.invoke(initial_state)
