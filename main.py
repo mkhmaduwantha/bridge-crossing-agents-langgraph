@@ -100,44 +100,44 @@ class SimulationState(TypedDict):
 # DESCRIPTIVE GRID EXPLANATION
 # ==========================================
 
-def describe_grid(state):
-    return f"""
-The world is a square grid that is 5 columns wide and 5 rows tall.
+# def describe_grid(state):
+#     return f"""
+# The world is a square grid that is 5 columns wide and 5 rows tall.
 
-Coordinates:
-- x increases as you move RIGHT.
-- y increases as you move UP.
+# Coordinates:
+# - x increases as you move RIGHT.
+# - y increases as you move UP.
 
-The middle column (x = 2) represents a river that runs vertically
-from the bottom of the grid to the top.
+# The middle column (x = 2) represents a river that runs vertically
+# from the bottom of the grid to the top.
 
-Most cells in this river are water and cannot be stepped on.
-The water cells are located at: {sorted(list(WALLS))}
+# Most cells in this river are water and cannot be stepped on.
+# The water cells are located at: {sorted(list(WALLS))}
 
-There are exactly two bridges that allow crossing the river:
+# There are exactly two bridges that allow crossing the river:
 
-1. The upper bridge located at {BRIDGES["upper bridge"]}
-2. The lower bridge located at {BRIDGES["lower bridge"]}
+# 1. The upper bridge located at {BRIDGES["upper bridge"]}
+# 2. The lower bridge located at {BRIDGES["lower bridge"]}
 
-Only ONE agent may stand on a bridge at any time.
+# Only ONE agent may stand on a bridge at any time.
 
-Movement Rules:
-- Each turn both agents move simultaneously.
-- You may move one step: UP, DOWN, LEFT, RIGHT, or STAY.
-- You cannot move outside the grid boundaries.
-- You cannot enter water cells.
-- You cannot occupy the same cell as the other agent.
-- You cannot swap positions in one move.
-- If a move is invalid, you remain in place.
+# Movement Rules:
+# - Each turn both agents move simultaneously.
+# - You may move one step: UP, DOWN, LEFT, RIGHT, or STAY.
+# - You cannot move outside the grid boundaries.
+# - You cannot enter water cells.
+# - You cannot occupy the same cell as the other agent.
+# - You cannot swap positions in one move.
+# - If a move is invalid, you remain in place.
 
-Current Positions:
-- A1 is at {state['grid_state']['A1']}
-- A2 is at {state['grid_state']['A2']}
+# Current Positions:
+# - A1 is at {state['grid_state']['A1']}
+# - A2 is at {state['grid_state']['A2']}
 
-Goals:
-- A1 must reach any cell where x = {A1_GOAL_X}
-- A2 must reach any cell where x = {A2_GOAL_X}
-"""
+# Goals:
+# - A1 must reach any cell where x = {A1_GOAL_X}
+# - A2 must reach any cell where x = {A2_GOAL_X}
+# """
 
 def describe_grid_for_agent(state, agent_name):
 
@@ -263,6 +263,8 @@ def describe_env_effect(agent_name, intended_move, old_pos, attempted_pos, final
     if reason_code is None:
         return f"{agent_name} moved {intended_move} from {old_pos} to {final_pos}."
     # It attempted something invalid and therefore stayed
+    if intended_move == "STAY":
+        return f"{agent_name} decided to {intended_move} in {old_pos}."
     return (
         f"{agent_name} tried {intended_move} from {old_pos} to {attempted_pos}, "
         f"but stayed at {final_pos}. Reason: {ENV_INVALID_DESCRIPTIONS.get(reason_code, reason_code)}"
@@ -277,11 +279,23 @@ def format_recent_rounds(state, n=3):
     for r in last:
         out.append(
             f"- Step {r['step']}:\n"
-            f"  Negotiation:\n{r['transcript'].rstrip()}\n"
-            f"  Final decisions: A1={r['move1']} | A2={r['move2']}\n"
+            # f"  Negotiation:\n{r['transcript'].rstrip()}\n"
+            f"  Final decisions of step {r['step']}: A1={r['move1']} | A2={r['move2']}\n"
             f"  Outcome: {r['outcome'].replace(chr(10),' ')}"
         )
     return "\n".join(out)
+
+def parse_mode(text: str) -> str:
+    if not text:
+        return "CHAT"
+    m = re.search(r"(?im)^\s*MODE\s*:\s*(PLAN|AGREE|REJECT|CHAT)\s*$", text)
+    return m.group(1).upper() if m else "CHAT"
+
+def parse_proposed_move_strict(text: str) -> str:
+    if not text:
+        return "STAY"
+    m = re.search(r"(?im)^\s*PROPOSED_MOVE\s*:\s*(UP|DOWN|LEFT|RIGHT|STAY)\s*$", text)
+    return m.group(1).upper() if m else "STAY"
 
 # ==========================================
 # NODE 1 — NEGOTIATION
@@ -317,18 +331,49 @@ Negotiation so far this step:
 
 You must propose your intended move AND send a short message.
 
-Respond EXACTLY in this format:
+NEGOTIATION POLICY (IMPORTANT):
+You must do exactly ONE of the following:
 
+A) If you see potential interference THIS TURN, propose a concrete plan.
+   Interference means one or more of:
+   - Both agents likely to target the same bridge cell (bridge contention)
+   - Same-cell collision risk
+   - Swap risk (you go to their cell while they go to yours)
+   - Your proposed move would hit WATER or go OUTSIDE GRID
+   - Repeating pattern: last 2 outcomes show no progress or repeated positions
+
+   If you choose PLAN, include EVIDENCE citing the previous outcomes (e.g., "In Step 22 and Step 23 we collided at lower bridge").
+
+B) If the other agent has a clear proposal already (in the transcript), either AGREE or REJECT it.
+   - If AGREE: confirm a complementary move that avoids interference.
+   - If REJECT: explain why it will interfere (cite evidence from recent outcomes if available) and propose an alternative.
+
+C) If you observe no interference and no meaningful proposal to respond to, output CHAT:
+   - Send an arbitrary short random message (no planning needed).
+
+OUTPUT FORMAT (MUST FOLLOW EXACTLY):
+MODE: <PLAN|AGREE|REJECT|CHAT>
 PROPOSED_MOVE: <UP|DOWN|LEFT|RIGHT|STAY>
-MESSAGE: <optional arbitraty message to other agent>
+MESSAGE: <short message to other agent>
+EVIDENCE: <1–2 sentences referencing recent outcomes OR "none">
 """
 
         response = llm_call(prompt, f"STEP {state['step']} — {speaker} NEGOTIATION")
 
-        proposed_move = parse_move(response)
-        message = response.split("MESSAGE:")[-1].strip() if "MESSAGE:" in response else ""
+        mode = parse_mode(response)
+        proposed_move = parse_proposed_move_strict(response)
 
-        transcript += f"{speaker}: PROPOSED_MOVE={proposed_move} | MESSAGE={message}\n"
+        message = ""
+        m_msg = re.search(r"(?im)^\s*MESSAGE\s*:\s*(.*)$", response)
+        if m_msg:
+            message = m_msg.group(1).strip()
+
+        evidence = ""
+        m_ev = re.search(r"(?im)^\s*EVIDENCE\s*:\s*(.*)$", response)
+        if m_ev:
+            evidence = m_ev.group(1).strip()
+
+        transcript += f"{speaker}: MODE={mode} | PROPOSED_MOVE={proposed_move} | MESSAGE={message} | EVIDENCE={evidence}\n"
 
     log_write("\n--- NEGOTIATION TRANSCRIPT ---")
     log_write(transcript)
@@ -435,25 +480,24 @@ def environment_node(state: SimulationState):
         a2_line = f"A2 intended {move2} from {a2_old} toward {a2_proposed}, but both stayed. Reason: {collision_desc}"
 
     outcome = f"""
-Step {state['step']} RESULT:
 {a1_line}
 {a2_line}
 Agent-agent collision: {collision_desc}
 """.strip()
 
-# Append goal status
-    goal_status = []
-    if state["a1_reached_goal"]:
-        goal_status.append("A1 has reached its goal (x=4).")
-    else:
-        goal_status.append("A1 has NOT reached its goal yet (needs x=4).")
+# # Append goal status
+#     goal_status = []
+#     if state["a1_reached_goal"]:
+#         goal_status.append("A1 has reached its goal (x=4).")
+#     else:
+#         goal_status.append("A1 has NOT reached its goal yet (needs x=4).")
 
-    if state["a2_reached_goal"]:
-        goal_status.append("A2 has reached its goal (x=0).")
-    else:
-        goal_status.append("A2 has NOT reached its goal yet (needs x=0).")
+#     if state["a2_reached_goal"]:
+#         goal_status.append("A2 has reached its goal (x=0).")
+#     else:
+#         goal_status.append("A2 has NOT reached its goal yet (needs x=0).")
 
-    outcome = outcome + "\n\nGOAL STATUS:\n" + "\n".join(goal_status)
+#     outcome = outcome + "\n\nGOAL STATUS:\n" + "\n".join(goal_status)
 
     log_write("\n--- EXECUTION RESULT ---")
     log_write(outcome)
